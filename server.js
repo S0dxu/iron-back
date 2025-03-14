@@ -44,7 +44,9 @@ const groupSchema = new mongoose.Schema({
   createdAt: { type: String, required: true },
   exercise: { type: String, required: true, enum: ["Push Ups", "Pull Ups", "Dips"] },
   days: { type: Number, required: true, min: 15, max: 90 },
-  members: { type: Map, of: Number }
+  members: { type: Map, of: Number },
+  startingPoint: { type: Number, required: true },
+  increment: { type: Number, required: true }
 });
 const Group = mongoose.model("Group", groupSchema);
 
@@ -86,7 +88,7 @@ app.post("/login", async (req, res) => {
     const passwordMatch = await bcrypt.compare(password, user.password);
     if (!passwordMatch) return res.status(400).json({ message: "Invalid credentials" });
 
-    const token = jwt.sign({ userId: user._id, username: user.username, avatar: user.avatar }, SECRET_KEY, { expiresIn: "7d" });
+    const token = jwt.sign({ userId: user._id, username: user.username, avatar: user.avatar, coin: user.coin }, SECRET_KEY, { expiresIn: "7d" });
 
     res.status(200).json({ message: "Login successful", token, username: user.username });
   } catch (error) {
@@ -96,31 +98,44 @@ app.post("/login", async (req, res) => {
 });
 
 app.post("/create-group", async (req, res) => {
-    try {
-        const { username, exercise, days } = req.body;
+  try {
+      const { username, exercise, days, startingPoint, increment } = req.body;
 
-        if (!username || !exercise || !days) {
-            return res.status(400).json({ message: "Tutti i campi sono obbligatori" });
-        }
+      if (!username || !exercise || !days || !startingPoint || !increment ) {
+          return res.status(400).json({ message: "Tutti i campi sono obbligatori" });
+      }
 
-        const groupId = uuidv4().slice(0, 12);
-        const createdAt = new Date().toLocaleDateString("it-IT");
+      const user = await User.findOne({ username });
+      if (!user) return res.status(404).json({ message: "Utente non trovato" });
 
-        const newGroup = new Group({
-            groupId,
-            createdAt,
-            exercise,
-            days,
-            members: { [username]: 0 }
-        });
+      if (user.currentGroup) {
+          return res.status(400).json({ message: "Sei già in un gruppo. Abbandonalo prima di crearne un altro." });
+      }
 
-        await newGroup.save();
-        res.status(201).json({ message: "Gruppo creato con successo", groupId });
-    } catch (error) {
-        console.error("Errore nella creazione del gruppo:", error);
-        res.status(500).json({ message: "Errore del server", error });
-    }
+      const groupId = uuidv4().slice(0, 12);
+      const createdAt = new Date().toLocaleDateString("it-IT");
+
+      const newGroup = new Group({
+          groupId,
+          createdAt,
+          exercise,
+          days,
+          members: { [username]: 0 },
+          startingPoint,
+          increment
+      });
+
+      await newGroup.save();
+      user.currentGroup = groupId;
+      await user.save();
+
+      res.status(201).json({ message: "Gruppo creato e unito con successo", groupId });
+  } catch (error) {
+      console.error("Errore nella creazione del gruppo:", error);
+      res.status(500).json({ message: "Errore del server", error });
+  }
 });
+
 
 app.post("/join-group", async (req, res) => {
   try {
@@ -206,6 +221,8 @@ app.get("/user-group/:username", async (req, res) => {
       members: membersWithAvatar,
       exercise: group.exercise,
       daysLeft: finalDaysLeft,
+      startingPoint: group.startingPoint,
+      increment: group.increment,
       totals:  group.days,
       history: user.history
     });
@@ -214,43 +231,90 @@ app.get("/user-group/:username", async (req, res) => {
     res.status(500).json({ message: "Errore del server", error });
   }
 });
-
-
-
 app.post("/leave-group", async (req, res) => {
   try {
-      const { username } = req.body;
+    const { username } = req.body;
 
-      if (!username) {
-          return res.status(400).json({ message: "Username richiesto" });
-      }
+    if (!username) {
+      return res.status(400).json({ message: "Username richiesto" });
+    }
 
-      const user = await User.findOne({ username });
-      if (!user || !user.currentGroup) {
-          return res.status(400).json({ message: "Non sei in nessun gruppo" });
-      }
+    const user = await User.findOne({ username });
+    if (!user || !user.currentGroup) {
+      return res.status(400).json({ message: "Non sei in nessun gruppo" });
+    }
 
-      const group = await Group.findOne({ groupId: user.currentGroup });
-      if (!group) {
-          user.currentGroup = null;
-          await user.save();
-          return res.status(404).json({ message: "Gruppo non trovato, ma stato utente aggiornato" });
-      }
+    const group = await Group.findOne({ groupId: user.currentGroup });
 
-      group.members.delete(username);
-      await group.save();
-
+    if (!group) {
       user.currentGroup = null;
       await user.save();
+      return res.status(404).json({ message: "Gruppo non trovato, stato utente aggiornato" });
+    }
 
-      res.status(200).json({ message: "Sei uscito dal gruppo con successo" });
+    group.members.delete(username);
+    await group.save();
+
+    user.coin = 0;
+    user.history = []
+    await user.save();
+
+    if (group.members.size === 0) {
+      await Group.deleteOne({ groupId: group.groupId });
+      return res.status(200).json({ message: "Sei uscito dal gruppo e il gruppo è stato eliminato perché vuoto" });
+    }
+
+    user.currentGroup = null;
+    await user.save();
+
+    res.status(200).json({ message: "Sei uscito dal gruppo con successo e i tuoi coin sono stati azzerati" });
+
   } catch (error) {
-      console.error("Errore nell'uscita dal gruppo:", error);
-      res.status(500).json({ message: "Errore del server", error });
+    console.error("Errore nell'uscita dal gruppo:", error);
+    res.status(500).json({ message: "Errore del server", error });
   }
 });
 
-app.get('/user/:token', (req, res) => {
+app.post("/cash", async (req, res) => {
+  try {
+    const { token, date } = req.body;
+
+    if (!token || !date) {
+      return res.status(400).json({ message: "Token e data sono richiesti" });
+    }
+
+    const decoded = jwt.verify(token, SECRET_KEY);
+    const username = decoded.username;
+
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(404).json({ message: "Utente non trovato" });
+    }
+    console.log(date)
+    console.log(user.history)
+
+    if (user.history.includes(date)) {
+      return res.status(400).json({ message: "Operazione già eseguita per questa data" });
+    }
+
+    user.history.push(date);
+    user.coin += 500;
+    await user.save();
+
+    res.status(200).json({ 
+      message: "Cash eseguito con successo", 
+      coin: user.coin,
+      username: user.username 
+    });
+    
+  } catch (error) {
+    console.error("Errore nell'endpoint /cash:", error);
+    res.status(500).json({ message: "Errore del server", error });
+  }
+});
+
+
+app.get('/user/:token', async (req, res) => {
   try {
     const { token } = req.params;
 
@@ -259,10 +323,15 @@ app.get('/user/:token', (req, res) => {
     }
 
     const decoded = jwt.verify(token, SECRET_KEY);
-
+    const username = decoded.username;
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(404).json({ message: "Utente non trovato" });
+    }
     res.json({
       username: decoded.username,
-      avatar: decoded.avatar
+      avatar: decoded.avatar,
+      coin: user.coin,
     });
 
   } catch (error) {
