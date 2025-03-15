@@ -259,10 +259,13 @@ app.delete("/delete-account", async (req, res) => {
 
 app.post("/leave-group", async (req, res) => {
   try {
-    const { username } = req.body;
-    if (!username) {
+    const { token } = req.body;
+    if (!token) {
       return res.status(400).json({ message: "Username is required" });
     }
+
+    const decoded = jwt.verify(token, SECRET_KEY);
+    const username = decoded.username;
     const user = await User.findOne({ username });
     if (!user || !user.currentGroup) {
       return res.status(400).json({ message: "You are not in any group" });
